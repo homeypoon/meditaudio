@@ -18,9 +18,12 @@ import matplotlib.pyplot as plt  # Module used for plotting
 from pylsl import StreamInlet, resolve_byprop  # Module to receive EEG data
 import utils
 
+import csv
+import os
+from datetime import datetime
+
+
 # Handy little enum to make code more readable
-
-
 class Band:
     Delta = 0
     Theta = 1
@@ -93,6 +96,16 @@ if __name__ == "__main__":
     # script with <Ctrl-C>
     print('Press Ctrl-C in the console to break the while loop.')
 
+    # Generate dynamic filename with timestamp
+    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    csv_file = f'eeg_data_{timestamp_str}.csv'
+
+    # Write header to the new CSV file
+    with open(csv_file, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Timestamp', 'TP9', 'AF7', 'AF8', 'TP10',
+                        'Right AUX', 'Alpha', 'Beta', 'Theta', 'Delta'])
+
     try:
         # The following loop acquires data, computes band powers, and calculates neurofeedback metrics based on those band powers
         while True:
@@ -133,20 +146,61 @@ if __name__ == "__main__":
             # Simple redout of alpha power, divided by delta waves in order to rule out noise
             alpha_metric = smooth_band_powers[Band.Alpha] / \
                 smooth_band_powers[Band.Delta]
-            print('Alpha Relaxation: ', alpha_metric)
+            # print('Alpha Relaxation: ', alpha_metric)
 
             # Beta Protocol:
             # Beta waves have been used as a measure of mental activity and concentration
             # This beta over theta ratio is commonly used as neurofeedback for ADHD
             beta_metric = smooth_band_powers[Band.Beta]
-            print('Beta Concentration: ', beta_metric)
+            # print('Beta Concentration: ', beta_metric)
 
             # Alpha/Theta Protocol:
             # This is another popular neurofeedback metric for stress reduction
             # Higher theta over alpha is supposedly associated with reduced anxiety
             theta_metric = smooth_band_powers[Band.Theta] / \
                 smooth_band_powers[Band.Alpha]
-            print('Theta Relaxation: ', theta_metric)
+            # print('Theta Relaxation: ', theta_metric)
+
+            if len(eeg_data) == 0:
+                continue  # Skip if no data received
+
+            # Convert to NumPy array
+            eeg_array = np.array(eeg_data)
+
+            # Get all 5 channels (assuming Muse 2016: TP9, AF7, AF8, TP10, Right AUX)
+            all_channels = eeg_array[:, :5]
+
+            # Extract only the channel of interest for band power (e.g., TP9)
+            ch_data = eeg_array[:, INDEX_CHANNEL]
+
+            # Update EEG buffer and apply filters
+            eeg_buffer, filter_state = utils.update_buffer(
+                eeg_buffer, ch_data, notch=True,
+                filter_state=filter_state)
+
+            # Get latest values from each channel (last row in all_channels)
+            latest_channels = all_channels[-1]
+
+            # Get the newest epoch and compute band powers
+            data_epoch = utils.get_last_data(eeg_buffer, EPOCH_LENGTH * fs)
+            band_powers = utils.compute_band_powers(data_epoch, fs)
+            band_buffer, _ = utils.update_buffer(
+                band_buffer, np.asarray([band_powers]))
+            smooth_band_powers = np.mean(band_buffer, axis=0)
+
+            # Save all data to CSV
+            with open(csv_file, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    *latest_channels,  # TP9, AF7, AF8, TP10, Right AUX
+                    smooth_band_powers[Band.Alpha],
+                    smooth_band_powers[Band.Beta],
+                    smooth_band_powers[Band.Theta],
+                    smooth_band_powers[Band.Delta]
+                ])
 
     except KeyboardInterrupt:
         print('Closing!')
+        # Close the CSV file
+        f.close()
