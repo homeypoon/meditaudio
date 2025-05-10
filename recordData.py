@@ -21,6 +21,7 @@ import utils
 import csv
 import os
 from datetime import datetime
+from time import time, sleep
 
 
 # Handy little enum to make code more readable
@@ -34,15 +35,14 @@ class Band:
 """ EXPERIMENTAL PARAMETERS """
 # Modify these to change aspects of the signal processing
 
-# Length of the EEG data buffer (in seconds)
 # This buffer will hold last n seconds of data and be used for calculations
-BUFFER_LENGTH = 5
+BUFFER_LENGTH = 15
 
 # Length of the epochs used to compute the FFT (in seconds)
-EPOCH_LENGTH = 1
+EPOCH_LENGTH = 2
 
 # Amount of overlap between two consecutive epochs (in seconds)
-OVERLAP_LENGTH = 0.8
+OVERLAP_LENGTH = 1
 
 # Amount to 'shift' the start of each next consecutive epoch
 SHIFT_LENGTH = EPOCH_LENGTH - OVERLAP_LENGTH
@@ -51,13 +51,47 @@ SHIFT_LENGTH = EPOCH_LENGTH - OVERLAP_LENGTH
 # 0 = left ear, 1 = left forehead, 2 = right forehead, 3 = right ear
 INDEX_CHANNEL = [0]
 
+# Timeout for stream resolution
+LSL_SCAN_TIMEOUT = 5
+
+
+def reconnect_stream(timeout=LSL_SCAN_TIMEOUT):
+    """
+    Reconnect to the EEG stream if disconnected
+    """
+    while True:
+        try:
+            print('Attempting to reconnect to EEG stream...')
+            streams = resolve_byprop('type', 'EEG', timeout=timeout)
+            if len(streams) == 0:
+                print('Can\'t find EEG stream. Retrying in 5 seconds...')
+                sleep(5)
+                continue
+
+            # Set active EEG stream to inlet and apply time correction
+            print("Reconnected. Resuming data acquisition...")
+            inlet = StreamInlet(streams[0], max_chunklen=12)
+            eeg_time_correction = inlet.time_correction()
+
+            # Get the stream info
+            info = inlet.info()
+            fs = int(info.nominal_srate())
+
+            return inlet, fs, eeg_time_correction
+
+        except Exception as e:
+            print(f'Error during reconnection: {e}')
+            print('Retrying in 5 seconds...')
+            sleep(5)
+
+
 if __name__ == "__main__":
 
     """ 1. CONNECT TO EEG STREAM """
 
     # Search for active LSL streams
     print('Looking for an EEG stream...')
-    streams = resolve_byprop('type', 'EEG', timeout=2)
+    streams = resolve_byprop('type', 'EEG', timeout=LSL_SCAN_TIMEOUT)
     if len(streams) == 0:
         raise RuntimeError('Can\'t find EEG stream.')
 
@@ -96,9 +130,13 @@ if __name__ == "__main__":
     # script with <Ctrl-C>
     print('Press Ctrl-C in the console to break the while loop.')
 
+    # Create folder to store CSVs
+    folder_name = "eeg_data"
+    os.makedirs(folder_name, exist_ok=True)
+
     # Generate dynamic filename with timestamp
     timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-    csv_file = f'eeg_data_{timestamp_str}.csv'
+    csv_file = os.path.join(folder_name, f'eeg_data_{timestamp_str}.csv')
 
     # Write header to the new CSV file
     with open(csv_file, mode='w', newline='') as f:
@@ -106,19 +144,53 @@ if __name__ == "__main__":
         writer.writerow(['Timestamp', 'TP9', 'AF7', 'AF8', 'TP10',
                         'Right AUX', 'Alpha', 'Beta', 'Theta', 'Delta'])
 
+    last_update = time()
+
     try:
-        # The following loop acquires data, computes band powers, and calculates neurofeedback metrics based on those band powers
         while True:
-
             """ 3.1 ACQUIRE DATA """
-            # Obtain EEG data from the LSL stream
-            eeg_data, timestamp = inlet.pull_chunk(
-                timeout=1, max_samples=int(SHIFT_LENGTH * fs))
+            try:
+                # Obtain EEG data from the LSL stream
+                eeg_data, timestamp = inlet.pull_chunk(
+                    timeout=1, max_samples=int(SHIFT_LENGTH * fs))
 
-            # Only keep the channel we're interested in
-            ch_data = np.array(eeg_data)[:, INDEX_CHANNEL]
+                # Update last successful data reception time
+                if len(eeg_data) > 0:
+                    last_update = time()
 
-            # Update EEG buffer with the new data
+            except Exception as e:
+                print(f'Lost connection to stream: {e}')
+                # Attempt to reconnect
+                inlet, fs, eeg_time_correction = reconnect_stream()
+                # Reinitialize buffers after reconnection if necessary
+                continue
+
+            # Check if we haven't received data for too long
+            if time() - last_update > 10:
+                print('No data received for 10 seconds. Attempting to reconnect...')
+                inlet, fs, eeg_time_correction = reconnect_stream()
+                last_update = time()
+                continue
+
+            # Check if we received data
+            if len(eeg_data) == 0:
+                continue  # Skip if no data received
+
+            # Convert to NumPy array
+            eeg_array = np.array(eeg_data)
+
+            # Get all channels for raw data storage
+            if eeg_array.shape[1] >= 5:
+                # Last sample, first 5 channels
+                latest_channels = eeg_array[-1, :5]
+            else:
+                # Use whatever channels are available
+                latest_channels = eeg_array[-1]
+
+            # Extract only the channel of interest for analysis
+            ch_data = eeg_array[:, INDEX_CHANNEL]
+
+            # Update EEG buffer with the new data (only once!)
             eeg_buffer, filter_state = utils.update_buffer(
                 eeg_buffer, ch_data, notch=True,
                 filter_state=filter_state)
@@ -132,62 +204,23 @@ if __name__ == "__main__":
             band_powers = utils.compute_band_powers(data_epoch, fs)
             band_buffer, _ = utils.update_buffer(band_buffer,
                                                  np.asarray([band_powers]))
-            # Compute the average band powers for all epochs in buffer
-            # This helps to smooth out noise
-            smooth_band_powers = np.mean(band_buffer, axis=0)
 
-            # print('Delta: ', band_powers[Band.Delta], ' Theta: ', band_powers[Band.Theta],
-            #       ' Alpha: ', band_powers[Band.Alpha], ' Beta: ', band_powers[Band.Beta])
+            # Compute the average band powers for all epochs in buffer
+            smooth_band_powers = np.mean(band_buffer, axis=0)
 
             """ 3.3 COMPUTE NEUROFEEDBACK METRICS """
-            # These metrics could also be used to drive brain-computer interfaces
-
-            # Alpha Protocol:
-            # Simple redout of alpha power, divided by delta waves in order to rule out noise
+            # Alpha Protocol
             alpha_metric = smooth_band_powers[Band.Alpha] / \
                 smooth_band_powers[Band.Delta]
-            # print('Alpha Relaxation: ', alpha_metric)
 
-            # Beta Protocol:
-            # Beta waves have been used as a measure of mental activity and concentration
-            # This beta over theta ratio is commonly used as neurofeedback for ADHD
+            # Beta Protocol
             beta_metric = smooth_band_powers[Band.Beta]
-            # print('Beta Concentration: ', beta_metric)
 
-            # Alpha/Theta Protocol:
-            # This is another popular neurofeedback metric for stress reduction
-            # Higher theta over alpha is supposedly associated with reduced anxiety
+            # Alpha/Theta Protocol
             theta_metric = smooth_band_powers[Band.Theta] / \
                 smooth_band_powers[Band.Alpha]
-            # print('Theta Relaxation: ', theta_metric)
 
-            if len(eeg_data) == 0:
-                continue  # Skip if no data received
-
-            # Convert to NumPy array
-            eeg_array = np.array(eeg_data)
-
-            # Get all 5 channels (assuming Muse 2016: TP9, AF7, AF8, TP10, Right AUX)
-            all_channels = eeg_array[:, :5]
-
-            # Extract only the channel of interest for band power (e.g., TP9)
-            ch_data = eeg_array[:, INDEX_CHANNEL]
-
-            # Update EEG buffer and apply filters
-            eeg_buffer, filter_state = utils.update_buffer(
-                eeg_buffer, ch_data, notch=True,
-                filter_state=filter_state)
-
-            # Get latest values from each channel (last row in all_channels)
-            latest_channels = all_channels[-1]
-
-            # Get the newest epoch and compute band powers
-            data_epoch = utils.get_last_data(eeg_buffer, EPOCH_LENGTH * fs)
-            band_powers = utils.compute_band_powers(data_epoch, fs)
-            band_buffer, _ = utils.update_buffer(
-                band_buffer, np.asarray([band_powers]))
-            smooth_band_powers = np.mean(band_buffer, axis=0)
-
+            """ 3.4 SAVE DATA """
             # Save all data to CSV
             with open(csv_file, mode='a', newline='') as f:
                 writer = csv.writer(f)
@@ -202,5 +235,4 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         print('Closing!')
-        # Close the CSV file
-        f.close()
+        print(f'Data saved to: {csv_file}')
