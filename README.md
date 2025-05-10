@@ -4,7 +4,7 @@ This program records EEG data and computes the associated band powers (Alpha, Be
 
 - **Timestamp**: The time the data was recorded.
 - **TP9, AF7, AF8, TP10, Right AUX**: EEG channel values.
-- **Alpha, Beta, Theta, Delta**: The respective band powers of the EEG signal.
+- **Alpha, Beta, Theta, Delta**: EEG frequency bands.
 
 ## Setup
 
